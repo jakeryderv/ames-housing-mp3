@@ -66,43 +66,47 @@ We then ran a 4 by 3 = 12-combo hyperparameter sweep on NN-B over `alpha` (L2 we
 
 The company has limited renovation capacity. The question: which houses should it pick to maximize expected investment gain?
 
-The optimization runs on all 2,928 cleaned properties (not just the test set), using the tuned NN-B predictions applied to the full dataset. Two quantities are derived per property:
+The optimization runs on the **586 test-set properties**, the same houses the neural network never saw during training. We use the tuned NN-B model from Part 3 to score those properties. Restricting to the test set matters: training and validation rows would give the NN artificially perfect predictions, conflating model fit with real out-of-sample signal.
 
-**Expected Gain** — the estimated market mispricing:
+Two quantities are derived per property:
 
-> ExpectedGain = PredictedPrice − SalePrice
+**Expected Gain** is the NN's residual on out-of-sample data:
 
-A positive value means the NN thinks the property sold for less than it's worth, i.e., an undervalued opportunity. A negative value means it sold for more than the model expects.
+> ExpectedGain = PredictedPrice - SalePrice
 
-**Renovation Burden** — a dimensionless proxy for the effort required to renovate each property, built from three Ames features:
+A positive value flags the property as priced lower than the NN's typical pattern would suggest, which is a candidate worth a closer look. A negative value means the NN thinks the property sold for more than expected. This is a heuristic, not a certified market-mispricing signal: the NN sees the same features the market sees, so the residual reflects either genuine noise the model couldn't capture or its own prediction error.
 
-> RenovationBurden = (10 − OverallCond) + (2026 − YearRemodAdd) / 10 + GrLivArea / 1000
+**Renovation Burden** is a dimensionless proxy for the effort required to renovate each property, built from three real Ames features and standardized so the components contribute on equal footing:
 
-The three terms capture condition (worse condition = more work), age since last remodel (older = more modernization needed), and size (larger = more labor). All components are grounded in real Ames features; no dollar costs are assumed.
+> RenovationBurden = z(10 - OverallCond) + z(2026 - YearRemodAdd) + z(GrLivArea)
 
-The budget is derived statistically rather than set by hand: the company is assumed to handle 10% of the total renovation workload across all 2,928 properties, so BUDGET = 0.10 × Σ RenovationBurden.
+where z(.) z-scores the column (subtract mean, divide by standard deviation). A final shift puts the minimum at 0 so all values are non-negative. The three terms capture condition (worse = more work), age since last remodel (older = more modernization), and size (larger = more labor). Z-scoring removes the unit mismatch between condition (1-10 scale), years (decades), and area (thousands of sqft).
+
+The budget is derived from the data rather than set by hand: the company is assumed to handle 10% of the total renovation workload across the 586 candidates, so BUDGET = 0.10 \* sum(RenovationBurden).
 
 The LP is a classic 0/1 knapsack:
 
-- **Decision:** for each property, x_i ∈ {0, 1} — invest or skip
-- **Objective:** maximize Σ ExpectedGain_i · x_i
-- **Constraint:** Σ RenovationBurden_i · x_i ≤ BUDGET
+- **Decision:** for each property, x_i is 0 (skip) or 1 (invest)
+- **Objective:** maximize the sum of ExpectedGain_i \* x_i over selected properties
+- **Constraint:** sum of RenovationBurden_i \* x_i must stay at or below BUDGET
 - **Solver:** PuLP's CBC (open-source MILP solver), checked for Optimal status before results are trusted.
 
 ## Key Insights
 
-**The optimizer targets market mispricing, not renovation ROI.** Unlike a renovation-simulation approach, ExpectedGain captures properties where the NN believes the market underpriced the house relative to its features — regardless of condition. The LP then filters those opportunities through a capacity constraint, selecting the highest-gain properties the company can actually handle.
+**Selected portfolio: 60 of 586 candidates (10.2%) for \$2.38M total Expected Gain** (about \$40K per property). The capacity constraint binds at 100%; every available unit of renovation budget is used.
 
-**The burden constraint introduces a genuine trade-off.** High-gain properties often carry high renovation burden (poor condition, large area, or long-unmodeled age), so the optimizer cannot simply stack the top-gain properties. A single high-burden outlier can consume as much budget as several lower-burden properties, forcing the LP to weigh gain-per-burden-unit rather than raw gain.
+**The optimizer ranks by NN residual, not certified mispricing.** ExpectedGain measures how far each property deviates from the NN's typical Ames pricing pattern. The model sees the same features the market sees, so residuals carry information but cannot reveal what the market doesn't already price in. Treat the LP output as a candidate list to investigate, not a final buy list.
 
-**Selected properties tend to be well-maintained and recently remodeled.** Because RenovationBurden rises sharply with poor condition and age since last remodel, the constraint naturally favors properties with OverallCond ≥ 6 and recent remodel years — not because those are explicitly required, but because they leave more budget for additional picks. Large properties are penalized by the size term even if their condition is good.
+**The burden constraint creates a genuine trade-off.** High-gain properties often carry high renovation burden (poor condition, large area, or long-unmodeled age), so the optimizer cannot simply stack the top-gain rows. The top selected pick has the maximum burden in the entire candidate pool (11.34) but is taken anyway because its gain (\$215K) is roughly 5x the next-best gain. Outliers can win when their gain is large enough to justify the burden cost.
 
-**The budget is dataset-driven, not arbitrary.** Setting BUDGET = 10% × Σ RenovationBurden means the constraint scales with the actual composition of the market being analyzed. A dataset of older, larger, worse-condition homes produces a tighter effective budget than one of newer, smaller, well-maintained ones, which is the correct behavior for a capacity-limited firm.
+**The picks tilt newer in remodel age but match the dataset on condition.** Average years since remodel is 31 for selected vs 42 dataset-wide; the age term in the burden formula systematically pushes toward more recently modernized homes. Average condition is 5.5/10 in both selected and overall, so condition is not the differentiator. Living area is slightly larger on average for picks (1,700 vs 1,513 sqft), driven partly by one large outlier dragging the mean up.
+
+**The budget is dataset-driven, not arbitrary.** Setting BUDGET to 10% of total burden means the constraint scales with the composition of the candidate pool. A pool of older, larger, worse-condition homes produces a tighter effective budget than one of newer, smaller, well-maintained ones, which is the right behavior for a capacity-limited firm.
 
 ## Limitations
 
 - **Single random seed.** Every comparison (NN-A vs NN-B, the tuning grid, the log-transform check) used `random_state=42`. The val R^2 gaps between top models are under 0.01, which is in noise range. Running 3 to 5 seeds would tell us whether NN-B truly beats NN-A or just got lucky on this split.
-- **ExpectedGain conflates prediction error with mispricing.** The quantity PredictedPrice − SalePrice captures both genuine undervaluation and NN prediction error. A property with a large positive gain might be a real bargain, or the NN might simply be wrong about it. With ~$30K test RMSE, the uncertainty on individual gain estimates is substantial and isn't quantified.
+- **ExpectedGain conflates prediction error with mispricing.** The quantity PredictedPrice - SalePrice captures both genuine undervaluation and NN prediction error. A property with a large positive gain might be a real bargain, or the NN might simply be wrong about it. With ~$30K test RMSE, the uncertainty on individual gain estimates is substantial and isn't quantified.
 - **Renovation Burden is a proxy without dollar grounding.** The burden formula (condition + age + size terms) captures the right intuitions but has no connection to actual construction cost. The 10% budget fraction is similarly a calibration choice. Sensitivity to these design decisions isn't tested in the current implementation.
 - **ExpectedGain can be negative, and the LP handles this implicitly.** Properties where the NN predicts less than the sale price contribute negative gain if selected. The LP avoids these automatically when optimizing, but there's no explicit filter, so near-zero or slightly negative properties near the budget boundary could be selected in edge cases.
 - **Hyperparameter search was narrow.** We tuned `alpha` and `learning_rate_init` but didn't touch `solver`, `activation`, or `batch_size`. Lbfgs in particular often outperforms Adam on small datasets like this one.
@@ -111,4 +115,4 @@ The LP is a classic 0/1 knapsack:
 
 The pipeline answers the original business question end to end. The neural network turns 8 features into a roughly \$30K-RMSE price estimate (test R^2 about 0.89), well above the mean-predictor baseline. The linear program then uses those predictions to identify undervalued properties and selects the optimal portfolio under a renovation capacity constraint.
 
-The prediction step is robust: NN-B beat 3 alternative architectures and held up across 12 hyperparameter combos, all chosen on a held-out val set. The optimization step is mathematically correct (LP returns Optimal status, constraint honored), but its interpretation rests on two design choices: that ExpectedGain = PredictedPrice − SalePrice is a meaningful proxy for undervaluation, and that the RenovationBurden formula captures the right property characteristics. Both are defensible but neither is ground truth. The honest takeaway: prediction tells us what each house is worth relative to its features; optimization tells us which undervalued houses we can actually afford to take on given capacity limits. Tightening the burden formula with real construction-cost data is the main thing a real engagement would need.
+The prediction step is robust: NN-B beat 3 alternative architectures and held up across 12 hyperparameter combos, all chosen on a held-out val set. The optimization step is mathematically correct (LP returns Optimal status, constraint honored), but its interpretation rests on two design choices: that ExpectedGain = PredictedPrice - SalePrice is a meaningful proxy for undervaluation, and that the RenovationBurden formula captures the right property characteristics. Both are defensible but neither is ground truth. The honest takeaway: prediction tells us what each house is worth relative to its features; optimization tells us which undervalued houses we can actually afford to take on given capacity limits. Tightening the burden formula with real construction-cost data is the main thing a real engagement would need.
